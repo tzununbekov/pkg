@@ -23,17 +23,23 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	kubeinformers "k8s.io/client-go/informers"
+	fakekubeclient "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
+
 	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	duckv1alpha1 "knative.dev/pkg/apis/duck/v1alpha1"
 	duckv1beta1 "knative.dev/pkg/apis/duck/v1beta1"
 	"knative.dev/pkg/client/injection/ducks/duck/v1/addressable"
+	"knative.dev/pkg/client/injection/kube/informers/core/v1/service"
 	fakedynamicclient "knative.dev/pkg/injection/clients/dynamicclient/fake"
 	"knative.dev/pkg/resolver"
 	"knative.dev/pkg/tracker"
@@ -418,12 +424,6 @@ func TestGetURIDestinationV1(t *testing.T) {
 			},
 			dest:    duckv1.Destination{Ref: addressableKnativeRef()},
 			wantURI: addressableDNS,
-		}, "happy ref to k8s service": {
-			objects: []runtime.Object{
-				getAddressableFromKRef(k8sServiceRef()),
-			},
-			dest:    duckv1.Destination{Ref: k8sServiceRef()},
-			wantURI: "http://testsink.testnamespace.svc.cluster.local",
 		}, "ref with relative uri": {
 			objects: []runtime.Object{
 				getAddressable(),
@@ -503,15 +503,13 @@ func TestGetURIDestinationV1(t *testing.T) {
 				},
 			},
 			wantErr: "absolute URI is not allowed when Ref or [apiVersion, kind, name] exists",
-		},
-		"nil url": {
+		}, "nil url": {
 			objects: []runtime.Object{
 				addressableNilURL(),
 			},
 			dest:    duckv1.Destination{Ref: unaddressableKnativeRef()},
 			wantErr: fmt.Sprintf("URL missing in address of %+v", unaddressableRef()),
-		},
-		"nil address": {
+		}, "nil address": {
 			objects: []runtime.Object{
 				addressableNilAddress(),
 			},
@@ -558,11 +556,35 @@ func TestGetURIDestinationV1(t *testing.T) {
 			dest:            duckv1.Destination{Ref: k8sServiceRef()},
 			customResolvers: []resolver.RefResolverFunc{noopURIResolver, sampleURIResolver},
 			wantURI:         "ref://" + addressableName + ".Service.v1",
-		}}
+		}, "happy with multiple sevice ports and annotation": {
+			dest:    duckv1.Destination{Ref: k8sServiceRef()},
+			objects: k8sServicesWithPortAnnotation(),
+			wantURI: "http://" + addressableName + "." + testNS + ".svc.cluster.local:8080",
+		}, "happy with multiple sevice ports and http port": {
+			dest:    duckv1.Destination{Ref: k8sServiceRef()},
+			objects: k8sServicesWithHTTPPort(),
+			wantURI: "http://" + addressableName + "." + testNS + ".svc.cluster.local",
+		}, "happy with multiple sevice ports and default port": {
+			dest:    duckv1.Destination{Ref: k8sServiceRef()},
+			objects: k8sServicesDefaultPort(),
+			wantURI: "http://" + addressableName + "." + testNS + ".svc.cluster.local:81",
+		},
+	}
 
 	for n, tc := range tests {
 		t.Run(n, func(t *testing.T) {
-			ctx, _ := fakedynamicclient.With(context.Background(), scheme.Scheme, tc.objects...)
+			ctx := context.Background()
+
+			kubeInformerFactory := kubeinformers.NewSharedInformerFactory(
+				fakekubeclient.NewSimpleClientset(tc.objects...), 0,
+			)
+			svcInformerIface := kubeInformerFactory.Core().V1().Services()
+			svcInformerIface.Informer() // register informer in factory
+			go kubeInformerFactory.Start(ctx.Done())
+			kubeInformerFactory.WaitForCacheSync(ctx.Done())
+
+			ctx = context.WithValue(ctx, service.Key{}, svcInformerIface)
+			ctx, _ = fakedynamicclient.With(ctx, scheme.Scheme, tc.objects...)
 			ctx = addressable.WithDuck(ctx)
 			r := resolver.NewURIResolverFromTracker(ctx, tracker.New(func(types.NamespacedName) {}, 0), tc.customResolvers...)
 
@@ -832,4 +854,102 @@ func sampleURIResolver(ctx context.Context, ref *corev1.ObjectReference) (bool, 
 
 func noopURIResolver(ctx context.Context, ref *corev1.ObjectReference) (bool, *apis.URL, error) {
 	return false, nil, nil
+}
+
+func k8sServicesWithPortAnnotation() []runtime.Object {
+	return []runtime.Object{
+		&corev1.Service{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Service",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      addressableName,
+				Namespace: testNS,
+				Annotations: map[string]string{
+					resolver.ServicePortAnnotation: "sink-target",
+				},
+			},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{
+						Name:     "http",
+						Protocol: "TCP",
+						Port:     80,
+					},
+					{
+						Name:     "sink-target",
+						Protocol: "TCP",
+						Port:     8080,
+					},
+				},
+			},
+			Status: corev1.ServiceStatus{},
+		},
+	}
+}
+
+func k8sServicesWithHTTPPort() []runtime.Object {
+	return []runtime.Object{
+		&corev1.Service{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Service",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      addressableName,
+				Namespace: testNS,
+			},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{
+						Name:     "https",
+						Protocol: "TCP",
+						Port:     443,
+					},
+					{
+						Name:     "http",
+						Protocol: "TCP",
+						Port:     80,
+					},
+				},
+			},
+			Status: corev1.ServiceStatus{},
+		},
+	}
+}
+
+func k8sServicesDefaultPort() []runtime.Object {
+	return []runtime.Object{
+		&corev1.Service{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Service",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      addressableName,
+				Namespace: testNS,
+			},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{
+						Name:     "foo",
+						Protocol: "TCP",
+						Port:     81,
+					},
+					{
+						Name:     "bar",
+						Protocol: "TCP",
+						Port:     8080,
+					},
+					{
+						Name:     "baz",
+						Protocol: "TCP",
+						Port:     8081,
+					},
+				},
+			},
+			Status: corev1.ServiceStatus{},
+		},
+	}
 }
