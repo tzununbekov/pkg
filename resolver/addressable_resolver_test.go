@@ -22,18 +22,28 @@ import (
 	"fmt"
 	"testing"
 
+	_ "knative.dev/pkg/client/injection/kube/informers/core/v1/service/fake"
+
 	"github.com/google/go-cmp/cmp"
+
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+
 	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	duckv1alpha1 "knative.dev/pkg/apis/duck/v1alpha1"
 	duckv1beta1 "knative.dev/pkg/apis/duck/v1beta1"
 	"knative.dev/pkg/client/injection/ducks/duck/v1/addressable"
+	kubeclient "knative.dev/pkg/client/injection/kube/client"
+	fakekubeclient "knative.dev/pkg/client/injection/kube/client/fake"
+	"knative.dev/pkg/client/injection/kube/informers/core/v1/service"
+	"knative.dev/pkg/injection"
 	fakedynamicclient "knative.dev/pkg/injection/clients/dynamicclient/fake"
 	"knative.dev/pkg/resolver"
 	"knative.dev/pkg/tracker"
@@ -503,15 +513,13 @@ func TestGetURIDestinationV1(t *testing.T) {
 				},
 			},
 			wantErr: "absolute URI is not allowed when Ref or [apiVersion, kind, name] exists",
-		},
-		"nil url": {
+		}, "nil url": {
 			objects: []runtime.Object{
 				addressableNilURL(),
 			},
 			dest:    duckv1.Destination{Ref: unaddressableKnativeRef()},
 			wantErr: fmt.Sprintf("URL missing in address of %+v", unaddressableRef()),
-		},
-		"nil address": {
+		}, "nil address": {
 			objects: []runtime.Object{
 				addressableNilAddress(),
 			},
@@ -558,14 +566,22 @@ func TestGetURIDestinationV1(t *testing.T) {
 			dest:            duckv1.Destination{Ref: k8sServiceRef()},
 			customResolvers: []resolver.RefResolverFunc{noopURIResolver, sampleURIResolver},
 			wantURI:         "ref://" + addressableName + ".Service.v1",
-		}}
+		},
+	}
 
 	for n, tc := range tests {
 		t.Run(n, func(t *testing.T) {
-			ctx, _ := fakedynamicclient.With(context.Background(), scheme.Scheme, tc.objects...)
+			ctx, _ := injection.Fake.SetupInformers(context.Background(), &rest.Config{})
+			ctx, _ = fakedynamicclient.With(ctx, scheme.Scheme, tc.objects...)
+			ctx, _ = fakekubeclient.With(ctx, k8sServices()...)
 			ctx = addressable.WithDuck(ctx)
 			r := resolver.NewURIResolverFromTracker(ctx, tracker.New(func(types.NamespacedName) {}, 0), tc.customResolvers...)
 
+			// returns empty list
+			list, err := service.Get(ctx).Lister().Services(testNS).Get(addressableName)
+			// returns list with test service
+			list, err = kubeclient.Get(ctx).CoreV1().Services(testNS).Get(ctx, addressableName, metav1.GetOptions{})
+			_, _ = list, err
 			// Run it twice since this should be idempotent. URI Resolver should
 			// not modify the cache's copy.
 			_, _ = r.URIFromDestinationV1(ctx, tc.dest, getAddressable())
@@ -832,4 +848,32 @@ func sampleURIResolver(ctx context.Context, ref *corev1.ObjectReference) (bool, 
 
 func noopURIResolver(ctx context.Context, ref *corev1.ObjectReference) (bool, *apis.URL, error) {
 	return false, nil, nil
+}
+
+func k8sServices() []runtime.Object {
+	return []runtime.Object{
+		&corev1.Service{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Service",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      addressableName,
+				Namespace: testNS,
+				Annotations: map[string]string{
+					"eventing.knative.dev/destination-port": "fooooo",
+				},
+			},
+			Spec: corev1.ServiceSpec{
+				Ports: []corev1.ServicePort{
+					{
+						Name:     "fooooo",
+						Protocol: "TCP",
+						Port:     80,
+					},
+				},
+			},
+			Status: corev1.ServiceStatus{},
+		},
+	}
 }
