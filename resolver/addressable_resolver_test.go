@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"testing"
 
+	_ "knative.dev/pkg/client/injection/kube/informers/core/v1/service/fake"
+
 	"github.com/google/go-cmp/cmp"
 
 	corev1 "k8s.io/api/core/v1"
@@ -33,6 +35,7 @@ import (
 	kubeinformers "k8s.io/client-go/informers"
 	fakekubeclient "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 
 	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
@@ -40,6 +43,7 @@ import (
 	duckv1beta1 "knative.dev/pkg/apis/duck/v1beta1"
 	"knative.dev/pkg/client/injection/ducks/duck/v1/addressable"
 	"knative.dev/pkg/client/injection/kube/informers/core/v1/service"
+	"knative.dev/pkg/injection"
 	fakedynamicclient "knative.dev/pkg/injection/clients/dynamicclient/fake"
 	"knative.dev/pkg/resolver"
 	"knative.dev/pkg/tracker"
@@ -359,7 +363,8 @@ func TestGetURIDestinationV1Beta1(t *testing.T) {
 
 	for n, tc := range tests {
 		t.Run(n, func(t *testing.T) {
-			ctx, _ := fakedynamicclient.With(context.Background(), scheme.Scheme, tc.objects...)
+			ctx, _ := injection.Fake.SetupInformers(context.Background(), &rest.Config{})
+			ctx, _ = fakedynamicclient.With(ctx, scheme.Scheme, tc.objects...)
 			ctx = addressable.WithDuck(ctx)
 			r := resolver.NewURIResolverFromTracker(ctx, tracker.New(func(types.NamespacedName) {}, 0))
 
